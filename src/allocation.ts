@@ -4,6 +4,20 @@ const allComponents: Component[] = ['hot_section', 'compressor', 'bearing', 'lub
 const dayMs = 24 * 60 * 60 * 1000;
 const round = (value: number, digits = 2) => Number(value.toFixed(digits));
 
+// 历史数据可能乱序落盘（如旧状态文件、批量导入），不能依赖数组首项，统一按 createdAt 选择最新一条
+export function latestByCreatedAt<T extends { createdAt: string }>(items: T[]): T | undefined {
+  let latest: T | undefined;
+  let latestTime = -Infinity;
+  for (const item of items) {
+    const time = Date.parse(item.createdAt);
+    if (Number.isFinite(time) && time > latestTime) { latest = item; latestTime = time; }
+  }
+  return latest;
+}
+
+const latestForEngine = <T extends { engineId: string; createdAt: string }>(items: T[], engineId: string): T | undefined =>
+  latestByCreatedAt(items.filter(item => item.engineId === engineId));
+
 export type AllocationInput = {
   engines: Engine[];
   assessments: HealthAssessment[];
@@ -16,8 +30,8 @@ type FingerprintEntry = { engineId: string; assessmentId: string | null; predict
 // 对机队最新评估、预测和维护数量生成指纹，用于识别方案过期
 export function fleetFingerprint(input: AllocationInput): string {
   const entries: FingerprintEntry[] = input.engines.map(engine => {
-    const assessment = input.assessments.find(item => item.engineId === engine.id);
-    const prediction = input.predictions.find(item => item.engineId === engine.id);
+    const assessment = latestForEngine(input.assessments, engine.id);
+    const prediction = latestForEngine(input.predictions, engine.id);
     return { engineId: engine.id, assessmentId: assessment?.assessmentId ?? null, predictionId: prediction?.predictionId ?? null, maintenanceCount: input.maintenance.filter(item => item.engineId === engine.id).length };
   }).sort((a, b) => a.engineId.localeCompare(b.engineId));
   return JSON.stringify(entries);
@@ -55,9 +69,9 @@ export function buildMaintenancePlan(options: AllocationInput & {
   type Candidate = { engine: Engine; assessment: HealthAssessment; prediction: RulPrediction; priorityScore: number; urgencyScore: number };
   const candidates: Candidate[] = [];
   for (const engine of [...options.engines].sort((a, b) => a.id.localeCompare(b.id))) {
-    const assessment = options.assessments.find(item => item.engineId === engine.id);
+    const assessment = latestForEngine(options.assessments, engine.id);
     if (!assessment) { excluded.push({ engineId: engine.id, reason: 'missing_assessment', detail: '尚未生成健康评估，无法参与维护资源分配' }); continue; }
-    const prediction = options.predictions.find(item => item.engineId === engine.id);
+    const prediction = latestForEngine(options.predictions, engine.id);
     if (!prediction) { excluded.push({ engineId: engine.id, reason: 'missing_prediction', detail: '缺少剩余寿命预测，无法确定维护窗口与寿命下界' }); continue; }
     const assessmentAge = (now - Date.parse(assessment.createdAt)) / dayMs;
     const predictionAge = (now - Date.parse(prediction.createdAt)) / dayMs;

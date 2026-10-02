@@ -1,7 +1,8 @@
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { buildMaintenancePlan } from '../src/allocation.js';
 import { createApp } from '../src/server.js';
 import { LocalStore } from '../src/store.js';
 import { Component, Engine, HealthAssessment, MaintenancePlanView, RulPrediction } from '../src/types.js';
@@ -128,5 +129,105 @@ describe('maintenance resource allocation', () => {
     const missing = await app.inject({ method: 'GET', url: '/api/maintenance-plans/PLAN-9999' });
     expect(missing.statusCode).toBe(404);
     await app.close();
+  });
+
+  it('uses the latest assessment and prediction by time when history is out of order', async () => {
+    const { file, store, app } = await setup();
+    const t1 = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const t2 = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
+    const t3 = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    const t4 = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
+    store.addEngine(engine('ENG-A'));
+    // 故意乱序插入：数组首项是最旧的评估/最新预测、末项是最新评估/旧预测
+    store.assessments.unshift(assessment('ENG-A', 45, t1));
+    store.assessments.push(assessment('ENG-A', 92, t3));
+    store.predictions.unshift(prediction('ENG-A', 60, 'bearing', t4));
+    store.predictions.push(prediction('ENG-A', 240, 'hot_section', t2));
+
+    // 直接构造：必须按 createdAt 选最新（92 分评估、lowerBound 60 的 bearing 预测），而非数组首项
+    const direct = buildMaintenancePlan({ id: 'PLAN-X', requestId: 'REQ-DIRECT', createdBy: 'tester', capacity: 1, now: new Date(), engines: store.engines, assessments: store.assessments, predictions: store.predictions, maintenance: store.maintenance });
+    expect(direct.slots).toHaveLength(1);
+    expect(direct.slots[0].healthScore).toBe(92);
+    expect(direct.slots[0].lowerBound).toBe(60);
+    expect(direct.slots[0].limitingComponent).toBe('bearing');
+    expect(direct.slots[0].assessmentId).toBe(`ASSESS-ENG-A-92`);
+    expect(direct.slots[0].predictionId).toBe('RUL-ENG-A-60-bearing');
+
+    // 通过接口再次验证 requireAssessment/requirePrediction 也按时间取最新
+    const plan = await postPlan(app, { requestId: 'REQ-UNORDERED', capacity: 1 });
+    expect(plan.slots[0].healthScore).toBe(92);
+    expect(plan.slots[0].lowerBound).toBe(60);
+    expect(plan.status).toBe('active');
+
+    // 指纹基于最新评估/预测：重启后乱序状态保持，方案仍应为 active 而非误报 stale
+    await app.close();
+    const restarted = await createApp(new LocalStore(file));
+    const reloaded = await getPlan(restarted, plan.id);
+    expect(reloaded.status).toBe('active');
+    expect(reloaded.slots).toEqual(plan.slots);
+    await restarted.close();
+  });
+
+  it('rejects when an older prediction precedes the newest assessment even in shuffled history', async () => {
+    const { store, app } = await setup();
+    const oldPredictionTime = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+    const newAssessmentTime = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
+    store.addEngine(engine('ENG-A'));
+    // 首项放最新评估，末项放旧预测：若误用数组首项会把旧预测当最新而漏判
+    store.assessments.unshift(assessment('ENG-A', 55, newAssessmentTime));
+    store.assessments.push(assessment('ENG-A', 90, oldPredictionTime));
+    store.predictions.unshift(prediction('ENG-A', 200, 'bearing', oldPredictionTime));
+
+    const plan = await postPlan(app, { requestId: 'REQ-SHUFFLE-STALE', capacity: 1 });
+    expect(plan.slots).toEqual([]);
+    expect(plan.excluded).toEqual([expect.objectContaining({ engineId: 'ENG-A', reason: 'stale_data' })]);
+    await app.close();
+  });
+
+  it('serializes concurrent writes with atomic replace and stays complete after restart and duplicate submissions', async () => {
+    const { dir, file, store, app } = await setup();
+    store.addEngine(engine('ENG-A')); store.addAssessment(assessment('ENG-A', 80)); store.addPrediction(prediction('ENG-A', 100));
+    store.addEngine(engine('ENG-B')); store.addAssessment(assessment('ENG-B', 60)); store.addPrediction(prediction('ENG-B', 80));
+
+    const created = await postPlan(app, { requestId: 'REQ-CONCURRENT', capacity: 2 });
+    expect(created.slots.map(slot => slot.engineId).sort()).toEqual(['ENG-A', 'ENG-B']);
+    expect(created.status).toBe('active');
+
+    // 并发：维护事件落盘 + 同一 requestId 的重复方案提交 + 裸 persist 同时发生
+    const eventPayload = { id: 'M-CONC', engineId: 'ENG-A', component: 'bearing' as Component, occurredAt: new Date().toISOString(), action: 'inspection' as const, severity: 'routine' as const, note: '并发写入复核' };
+    const responses = await Promise.all([
+      app.inject({ method: 'POST', url: '/api/maintenance-events', payload: eventPayload }),
+      ...Array.from({ length: 8 }, () => app.inject({ method: 'POST', url: '/api/maintenance-plans', payload: { requestId: 'REQ-CONCURRENT', capacity: 2 } })),
+      store.persist().then(() => undefined)
+    ]);
+    expect(responses[0].statusCode).toBe(200);
+    const plans = responses.slice(1, 9).map(res => JSON.parse((res as Awaited<ReturnType<typeof app.inject>>).body) as MaintenancePlanView);
+    expect(plans.every(item => item.id === created.id)).toBe(true);
+    expect(plans.every(item => item.slots.length === 2)).toBe(true);
+    expect(store.plans).toHaveLength(1);
+
+    // 目录下不应残留临时文件
+    const leftovers = (await readdir(dir)).filter(name => name.includes('.tmp-'));
+    expect(leftovers).toEqual([]);
+
+    // 重启后：方案、维护事件都完整可查询，且方案因新维护事件标记 stale
+    await app.close();
+    const restartedApp = await createApp(new LocalStore(file));
+    const list = JSON.parse((await restartedApp.inject({ method: 'GET', url: '/api/maintenance-plans' })).body) as MaintenancePlanView[];
+    expect(list).toHaveLength(1);
+    expect(list[0].slots.map(slot => slot.engineId).sort()).toEqual(['ENG-A', 'ENG-B']);
+    expect(list[0].excluded).toEqual(created.excluded);
+    expect(list[0].status).toBe('stale');
+    expect(list[0].staleReasons.join()).toContain('维护事件');
+    const onDisk = JSON.parse(await readFile(file, 'utf8')) as { maintenance: unknown[]; plans: unknown[] };
+    expect(onDisk.maintenance.some(item => (item as { id: string }).id === 'M-CONC')).toBe(true);
+    expect(onDisk.plans).toHaveLength(1);
+
+    // 重启后用同一 requestId 重复提交，仍返回同一方案而不新建
+    const duplicate = JSON.parse((await restartedApp.inject({ method: 'POST', url: '/api/maintenance-plans', payload: { requestId: 'REQ-CONCURRENT', capacity: 2 } })).body) as MaintenancePlanView;
+    expect(duplicate.id).toBe(created.id);
+    const afterDuplicate = JSON.parse((await restartedApp.inject({ method: 'GET', url: '/api/maintenance-plans' })).body) as MaintenancePlanView[];
+    expect(afterDuplicate).toHaveLength(1);
+    await restartedApp.close();
   });
 });
