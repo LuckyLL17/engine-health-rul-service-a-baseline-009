@@ -2,6 +2,7 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { fleetFingerprint } from '../src/allocation.js';
 import { createApp } from '../src/server.js';
 import { LocalStore } from '../src/store.js';
 import { Component, Engine, HealthAssessment, MaintenancePlanView, RulPrediction } from '../src/types.js';
@@ -128,5 +129,89 @@ describe('maintenance resource allocation', () => {
     const missing = await app.inject({ method: 'GET', url: '/api/maintenance-plans/PLAN-9999' });
     expect(missing.statusCode).toBe(404);
     await app.close();
+  });
+
+  it('selects the newest assessment and prediction when history is stored out of order', async () => {
+    const { file, store, app } = await setup();
+    // 历史按乱序写入：旧评估排在数组首位（修复前 .find 会误取首项）
+    const olderTime = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+    const latestTime = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const newerPredictionTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    store.addEngine(engine('ENG-A'));
+    store.addAssessment({ ...assessment('ENG-A', 40, latestTime), componentRisks: [{ component: 'bearing', score: 60, status: 'degraded', drivers: [], estimatedCyclesToLimit: 100 }] });
+    store.addAssessment(assessment('ENG-A', 95, olderTime));
+    // 先放新预测再放旧预测，使旧预测落到数组首位
+    store.addPrediction(prediction('ENG-A', 60, 'bearing', newerPredictionTime));
+    store.addPrediction(prediction('ENG-A', 260, 'bearing', olderTime));
+
+    store.addEngine(engine('ENG-B'));
+    store.addAssessment(assessment('ENG-B', 90));
+    store.addPrediction(prediction('ENG-B', 200));
+
+    // buildMaintenancePlan：必须按时间取最新评估（40 分）与最新预测（下界 60）
+    const plan = await postPlan(app, { requestId: 'REQ-UNORDERED', capacity: 1 });
+    expect(plan.status).toBe('active');
+    expect(plan.slots).toHaveLength(1);
+    expect(plan.slots[0].engineId).toBe('ENG-A');
+    expect(plan.slots[0].healthScore).toBe(40);
+    expect(plan.slots[0].lowerBound).toBe(60);
+    expect(plan.slots[0].assessmentId).toBe('ASSESS-ENG-A-40');
+    expect(plan.slots[0].predictionId).toBe('RUL-ENG-A-60-bearing');
+    expect(plan.excluded.map(item => item.engineId)).toEqual(['ENG-B']);
+
+    // 指纹与数组顺序无关：打乱历史后方案仍判定为 active
+    store.assessments.reverse();
+    store.predictions.reverse();
+    const shuffledView = await getPlan(app, plan.id);
+    expect(shuffledView.status).toBe('active');
+    expect(fleetFingerprint({ engines: store.engines, assessments: store.assessments, predictions: store.predictions, maintenance: store.maintenance })).toBe(plan.inputFingerprint);
+
+    // GET 发动机详情同样返回时间最新的一条
+    const detail = JSON.parse((await app.inject({ method: 'GET', url: '/api/engines/ENG-A' })).body) as { latestAssessment: HealthAssessment; latestPrediction: RulPrediction };
+    expect(detail.latestAssessment.assessmentId).toBe('ASSESS-ENG-A-40');
+    expect(detail.latestPrediction.predictionId).toBe('RUL-ENG-A-60-bearing');
+
+    // requirePrediction：维护模拟基于最新预测（下界 60）
+    const simulation = JSON.parse((await app.inject({ method: 'POST', url: '/api/engines/ENG-A/maintenance-simulation', payload: { delayCycles: 10 } })).body) as { windows: Array<{ startCycle: number }>; impact: { additionalRisk: number } };
+    expect(simulation.windows[0].startCycle).toBe(25);
+    expect(simulation.impact.additionalRisk).toBe(10);
+
+    // requireAssessment：重新生成预测时证据应引用最新评估（40 分），而非首项旧评估（95 分）
+    const created = JSON.parse((await app.inject({ method: 'POST', url: '/api/engines/ENG-A/rul-prediction', payload: { horizonCycles: 240 } })).body) as RulPrediction;
+    expect(created.evidence.some(line => line.includes('健康评分 40'))).toBe(true);
+
+    await app.close();
+
+    // 重启后乱序历史仍完整，方案仍可查询且仍选中最新数据
+    const restarted = await createApp(new LocalStore(file));
+    const reloaded = await getPlan(restarted, plan.id);
+    expect(reloaded.slots).toEqual(plan.slots);
+    expect(reloaded.slots[0].assessmentId).toBe('ASSESS-ENG-A-40');
+    expect(reloaded.slots[0].predictionId).toBe('RUL-ENG-A-60-bearing');
+    await restarted.close();
+  });
+
+  it('deduplicates concurrent duplicate submissions and keeps the plan queryable after restart', async () => {
+    const { file, store, app } = await setup();
+    store.addEngine(engine('ENG-A')); store.addAssessment(assessment('ENG-A', 70)); store.addPrediction(prediction('ENG-A', 100));
+
+    // 并发重复提交同一 requestId：所有请求共享事件循环中的同步查重，只应生成一个方案
+    const responses = await Promise.all(Array.from({ length: 8 }, () => postPlan(app, { requestId: 'REQ-CONCURRENT', capacity: 1 })));
+    const ids = new Set(responses.map(item => item.id));
+    expect(ids).toHaveLength(1);
+    expect(store.plans).toHaveLength(1);
+    for (const response of responses) {
+      expect(response.id).toBe([...ids][0]);
+      expect(response.slots).toHaveLength(1);
+    }
+
+    await app.close();
+    const restarted = await createApp(new LocalStore(file));
+    const list = JSON.parse((await restarted.inject({ method: 'GET', url: '/api/maintenance-plans' })).body) as MaintenancePlanView[];
+    expect(list).toHaveLength(1);
+    const reloaded = await getPlan(restarted, [...ids][0]);
+    expect(reloaded.requestId).toBe('REQ-CONCURRENT');
+    expect(reloaded.slots.map(slot => slot.engineId)).toEqual(['ENG-A']);
+    await restarted.close();
   });
 });
